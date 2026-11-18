@@ -87,10 +87,11 @@ def _cls_keys(d):
 # ----------------------------------------------------------------------------------------------
 # 1. predictions, decoding and metrics
 # ----------------------------------------------------------------------------------------------
-def predict_logits(model, data, batch_size=16, workers=8, max_queue_size=64):
+def predict_logits(model, data, batch_size=16, workers=8, max_queue_size=64, verbose=0):
     """Run the model once over a dataset dict and keep the raw output maps (so thresholds can be swept cheaply)."""
-    gen = biondi.dataset.TrainingGenerator(data=data, batch_size=batch_size, retinanet=True, validation=True)
-    preds = model.predict(gen, workers=workers, max_queue_size=max_queue_size, verbose=1)
+    # augmentation-free generator that always passes every input the model expects (older biondi drops cls/reg)
+    gen = AugmentedRetinaNetGenerator(data=data, batch_size=batch_size, geo_ops=(), colour=False, validation=True)
+    preds = model.predict(gen, workers=workers, max_queue_size=max_queue_size, verbose=verbose)
     if isinstance(preds, list):
         preds = {k: p for k, p in zip(model.output_names, preds)}
     return {k: np.asarray(v) for k, v in preds.items()}
@@ -188,6 +189,10 @@ def plot_sweep(df, title='Score threshold sweep'):
 
 def evaluate_checkpoints(paths, bb, data, iou_thr=0.5, thresholds=None):
     """Best F1 (over score thresholds) for each saved model. Use to pick the checkpoint."""
+    paths = list(paths)
+    if not paths:
+        raise ValueError('No checkpoints found. Check the folder path (use os.path.expanduser for "~") '
+                         'and that it ends with "/".')
     true = ground_truth_boxes(bb, data)
     rows, cutoff = [], None
     for p in paths:
@@ -241,8 +246,10 @@ def show_tiles(data, pred_boxes, true_boxes, tiles, iou_thr=0.5, ncols=4, size=4
     fig, axes = plt.subplots(nrows, ncols, figsize=(size * ncols, size * nrows), squeeze=False)
     for ax in axes.ravel():
         ax.axis('off')
+    imgs = np.asarray(data['dat'])
+    imgs = imgs.reshape((-1,) + imgs.shape[-3:])  # -> (n, H, W, C) regardless of extra singleton axes
     for ax, i in zip(axes.ravel(), tiles):
-        img = np.squeeze(np.asarray(data['dat'][i]))[..., :3].astype(float)
+        img = imgs[i][..., :3].astype(float)
         img = (img - img.min()) / (np.ptp(img) + 1e-9)
         ax.imshow(img)
         p, t = _as_boxes(pred_boxes[i]), _as_boxes(true_boxes[i])
@@ -405,9 +412,23 @@ if biondi is not None:
         Pass layout/geo_ops from calibrate_geometry(bb, x). Validation/test generators should stay plain.
         """
         def __init__(self, data, batch_size, layout=None, geo_ops=(), colour=True, seed=None, **kwargs):
+            import inspect
+            accepted = inspect.signature(biondi.dataset.TrainingGenerator.__init__).parameters
             kwargs.setdefault('retinanet', True)
-            kwargs['contrast'] = False
+            # older biondi versions don't have every augmentation option; only pass the ones this version takes
+            for opt in ('contrast', 'flip', 'rotation'):
+                if opt in accepted:
+                    kwargs[opt] = False
+                else:
+                    kwargs.pop(opt, None)
             super().__init__(data=data, batch_size=batch_size, **kwargs)
+            self.normalize = getattr(self, 'normalize', kwargs.get('normalize', True))
+            self.per_channel = getattr(self, 'per_channel', kwargs.get('per_channel', False))
+            self.c_idx_start = getattr(self, 'c_idx_start', 0)
+            if not hasattr(self, 'keys'):
+                self.keys = self.data.keys()
+            if not hasattr(self, 'indexes'):
+                self.indexes = np.arange(len(self.data['dat']))
             self.layout, self.geo_ops, self.colour = layout, tuple(geo_ops), colour
             self.rng = np.random.default_rng(seed)
             if self.geo_ops and layout is None:
@@ -417,6 +438,8 @@ if biondi is not None:
             batch_idx = self.indexes[index * self.batch_size:(index + 1) * self.batch_size]
             batch = {k: np.asarray(self.data[k][batch_idx]) for k in self.keys}
             batch['dat'] = batch['dat'][..., self.c_idx_start:]
+            # always work on (n, H, W, C), whatever extra singleton axes the stored data has
+            batch['dat'] = batch['dat'].reshape((len(batch_idx),) + batch['dat'].shape[-3:])
             if self.geo_ops:
                 for j in range(len(batch_idx)):
                     ops = [op for op in self.geo_ops if self.rng.random() < 0.5]
