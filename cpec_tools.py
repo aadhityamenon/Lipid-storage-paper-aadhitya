@@ -286,9 +286,26 @@ def _spatial_op(a, op):
     raise ValueError(op)
 
 
+def _target_op(a, op, layout):
+    """
+    Flip/transpose a target map (cls, reg or mask). jarvis' anchor grid is not centred in the tile (anchors sit at
+    0, 8, ..., 248 rather than 4, 12, ..., 252), so a flipped map must also move by one cell to land on the mirrored
+    anchors. The calibrated shift is in layout['sx'] / layout['sy']; the one row/column that has no source anchor is
+    zeroed, which for the mask keys means it is simply left out of the loss.
+    """
+    a = _spatial_op(a, op)
+    shift, axis = {'hflip': (layout.get('sx', 0), -2), 'vflip': (layout.get('sy', 0), -3)}.get(op, (0, None))
+    if shift:
+        a = np.roll(a, shift, axis=axis)
+        sl = [slice(None)] * a.ndim
+        sl[axis] = slice(0, shift) if shift > 0 else slice(shift, None)
+        a[tuple(sl)] = 0
+    return a
+
+
 def _reg_op(reg, op, layout):
     """Spatially transform a regression map, then fix the per-anchor deltas using the calibrated layout."""
-    reg = _spatial_op(reg, op).copy()
+    reg = _target_op(reg, op, layout).copy()
     shp = reg.shape
     r = reg.reshape(shp[:-1] + (shp[-1] // 4, 4))
     if op == 'hflip':
@@ -309,10 +326,12 @@ def apply_geometry(sample, ops, layout):
     for k, v in sample.items():
         v = np.asarray(v)
         for op in ops:
-            if k.startswith('reg') and 'msk' not in k:
+            if k == 'dat':
+                v = _spatial_op(v, op)            # images flip exactly
+            elif k.startswith('reg') and 'msk' not in k:
                 v = _reg_op(v, op, layout)
             else:
-                v = _spatial_op(v, op)
+                v = _target_op(v, op, layout)
         out[k] = np.ascontiguousarray(v)
     return out
 
@@ -360,13 +379,15 @@ def calibrate_geometry(bb, data, n_tiles=40, tol=2.0, ops=('hflip', 'vflip', 'tr
         return float(np.percentile(errs, 90))
 
     layout, ok = {}, []
-    for axis, op in [('x', 'hflip'), ('y', 'vflip')]:
-        errs = {c: max_err(op, {'x': c, 'y': c, 'h': 0, 'w': 0}) for c in range(4)}
-        c = min(errs, key=errs.get)
-        layout[axis] = c
-        if errs[c] <= tol and op in ops:
+    for axis, skey, op in [('x', 'sx', 'hflip'), ('y', 'sy', 'vflip')]:
+        errs = {(c, sh): max_err(op, {'x': c, 'y': c, 'h': 0, 'w': 0, skey: sh})
+                for c in range(4) for sh in (0, 1, -1)}
+        (c, sh) = min(errs, key=errs.get)
+        layout[axis], layout[skey] = c, sh
+        if errs[(c, sh)] <= tol and op in ops:
             ok.append(op)
-        print(f'{op}: channel {c} max error {errs[c]:.2f} px', '(ok)' if errs[c] <= tol else '(DISABLED)')
+        print(f'{op}: channel {c}, grid shift {sh:+d}, max error {errs[(c, sh)]:.2f} px',
+              '(ok)' if errs[(c, sh)] <= tol else '(DISABLED)')
     rest = [c for c in range(4) if c not in (layout['x'], layout['y'])]
     if 'transpose' in ops and len(rest) == 2 and layout['x'] != layout['y']:
         best = None
